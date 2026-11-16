@@ -73,11 +73,11 @@ body{overflow:hidden}
       <div class="field"><label for="askColor">Ask line</label><input id="askColor" type="color" value="#ff525e"></div>
     </div>
     <div class="field" style="margin-top:14px">
-      <label>Symbols to display (choose from broker's available symbols)</label>
+      <label>Symbols to display</label>
       <input id="searchSymbols" type="search" placeholder="Search symbols…" style="background:#151f2d;color:white;border:1px solid #2a394d;border-radius:8px;padding:9px">
       <div class="symbols" id="symbolPicker"><span class="smallnote">Load symbols first…</span></div>
     </div>
-    <div class="smallnote">The public plugin SDK returns the broker's available symbols, not the user's saved cTrader watchlist. This selector stores a custom list inside this plugin. Chart appearance colours are plugin settings; cTrader's native chart colour template is not exposed through the public SDK.</div>
+    <div class="smallnote">Candles are built from live quotes only (no history API in this SDK version). On Web, if quotes never arrive, check Console (F12).</div>
     <div class="actions"><button id="cancelSettings">Cancel</button><button id="applySettings">Apply</button></div>
   </section>
 </div>
@@ -92,7 +92,6 @@ import { take, tap, catchError, timeout } from "https://esm.sh/rxjs@7.8.2";
 import { createLogger } from "https://esm.sh/@veksa/logger@1.0.6";
 
 const $ = id => document.getElementById(id);
-
 const state = {
   adapter: null,
   connected: false,
@@ -100,39 +99,116 @@ const state = {
   selected: [],
   bars: new Map(),
   quotes: new Map(),
+  quoteCount: 0,
+  loggedFirstQuote: false,
   settings: {
-    height: 230,
-    count: 65,
-    tf: 7,
-    fontSize: 14,
-    up: "#18c79a",
-    down: "#f04452",
-    bid: "#2f9cff",
-    ask: "#ff525e"
+    height: 230, count: 65, tf: 7, fontSize: 14,
+    up: "#18c79a", down: "#f04452", bid: "#2f9cff", ask: "#ff525e"
   },
   tfNames: {
-    1: "M1", 2: "M2", 3: "M3", 4: "M4", 5: "M5", 6: "M10",
-    7: "M15", 8: "M30", 9: "H1", 10: "H4", 11: "H12",
-    12: "D1", 13: "W1", 14: "MN1"
+    1:"M1",2:"M2",3:"M3",4:"M4",5:"M5",6:"M10",7:"M15",8:"M30",
+    9:"H1",10:"H4",11:"H12",12:"D1",13:"W1",14:"MN1"
   }
 };
 
 const setStatus = s => { $("status").textContent = s; };
 const safeNum = v => Number(v ?? 0);
 
+function extractQuotes(rawEv) {
+  const out = [];
+  const push = x => {
+    if (!x) return;
+    if (Array.isArray(x)) x.forEach(push);
+    else if (typeof x === "object") out.push(x);
+  };
+
+  push(rawEv);
+  push(rawEv?.payload);
+  push(rawEv?.payload?.payload);
+  push(rawEv?.quote);
+  push(rawEv?.quotes);
+  push(rawEv?.payload?.quote);
+  push(rawEv?.payload?.quotes);
+  push(rawEv?.payload?.payload?.quote);
+  push(rawEv?.payload?.payload?.quotes);
+
+  // بعضی پاسخ‌ها خود event را داخل فیلدهای دیگر می‌گذارند
+  if (rawEv && typeof rawEv === "object") {
+    for (const k of Object.keys(rawEv)) {
+      const v = rawEv[k];
+      if (v && typeof v === "object" && (v.bid != null || v.Bid != null || v.ask != null || v.Ask != null || v.symbolId != null || v.SymbolId != null)) {
+        push(v);
+      }
+    }
+  }
+  return out;
+}
+
+function handleQuoteEvent(rawEv) {
+  if (!state.loggedFirstQuote) {
+    state.loggedFirstQuote = true;
+    console.log("[Multi Charts] FIRST quoteEvent raw:", rawEv);
+    try { console.log("[Multi Charts] FIRST quoteEvent JSON:", JSON.stringify(rawEv).slice(0, 1500)); } catch {}
+  }
+
+  const candidates = extractQuotes(rawEv);
+  let processed = 0;
+
+  candidates.forEach(q => {
+    const quoteId = q.symbolId ?? q.SymbolId ?? q.id ?? q.Id;
+    if (quoteId == null) return;
+
+    const id = String(quoteId);
+    state.quotes.set(id, q);
+
+    const supplied = q.trendbar ?? q.Trendbar ?? q.trendbars ?? [];
+    if (Array.isArray(supplied) && supplied.length) {
+      const incoming = supplied.map(b => decodeTrendbar(b)).filter(Boolean);
+      if (incoming.length) state.bars.set(id, incoming.slice(-state.settings.count));
+    }
+
+    let bidRaw = safeNum(q.bid ?? q.Bid);
+    let askRaw = safeNum(q.ask ?? q.Ask);
+
+    // اگر قیمت خیلی بزرگ بود همان /100000، اگر شبیه قیمت واقعی بود دست نزن
+    let bid, ask;
+    if (bidRaw > 1000 || askRaw > 1000) {
+      bid = bidRaw / 100000;
+      ask = askRaw / 100000;
+    } else {
+      bid = bidRaw;
+      ask = askRaw;
+    }
+
+    const px = (bid > 0 && ask > 0) ? (bid + ask) / 2 : (bid || ask);
+    if (px > 0) {
+      updateLiveCandle(id, px, q);
+      processed++;
+    }
+  });
+
+  if (processed > 0) {
+    state.quoteCount += processed;
+    if (state.quoteCount <= 3 || state.quoteCount % 20 === 0) {
+      setStatus("Live quotes: " + state.quoteCount + " updates • " + state.quotes.size + " symbols");
+    }
+    drawAll();
+  }
+}
+
 function connect() {
   if (state.adapter) {
     try { state.adapter.dispose?.(); } catch {}
     state.adapter = null;
   }
+  state.quoteCount = 0;
+  state.loggedFirstQuote = false;
 
   const logger = createLogger(new URLSearchParams(location.search).has("showLogs"));
   state.adapter = createClientAdapter({ logger });
 
-  // 1. First confirm
   handleConfirmEvent(state.adapter, {}).pipe(take(1)).subscribe();
 
-  // 2. registerEvent → 3. second confirm
   registerEvent(state.adapter).pipe(
     take(1),
     timeout(12000),
@@ -141,67 +217,20 @@ function connect() {
       state.connected = true;
       setStatus("Connected • Loading symbols…");
 
-      // گوش دادن به quoteها باید قبل از subscribeQuotes باشد
-      quoteEvent(state.adapter).subscribe(rawEv => {
-        // پشتیبانی از ساختارهای مختلف (flat یا nested)
-        const candidates = [];
-        if (rawEv) candidates.push(rawEv);
-        if (rawEv?.payload) candidates.push(rawEv.payload);
-        if (rawEv?.payload?.payload) candidates.push(rawEv.payload.payload);
-        if (rawEv?.quote) {
-          const q = rawEv.quote;
-          if (Array.isArray(q)) candidates.push(...q);
-          else candidates.push(q);
-        }
-        if (rawEv?.quotes) {
-          const q = rawEv.quotes;
-          if (Array.isArray(q)) candidates.push(...q);
-          else candidates.push(q);
-        }
-
-        let processed = 0;
-        candidates.forEach(q => {
-          if (!q || typeof q !== "object") return;
-
-          const quoteId = q.symbolId ?? q.SymbolId ?? q.id ?? q.Id;
-          if (quoteId == null) return;
-
-          const id = String(quoteId);
-          state.quotes.set(id, q);
-
-          // trendbar اگر وجود داشت
-          const supplied = q.trendbar ?? q.Trendbar ?? q.trendbars ?? [];
-          if (Array.isArray(supplied) && supplied.length) {
-            const incoming = supplied.map(b => decodeTrendbar(b)).filter(Boolean);
-            if (incoming.length) {
-              state.bars.set(id, incoming.slice(-state.settings.count));
-            }
-          }
-
-          // قیمت زنده (طبق مستندات: واحد 1/100000)
-          const bidRaw = safeNum(q.bid ?? q.Bid);
-          const askRaw = safeNum(q.ask ?? q.Ask);
-          const bid = bidRaw / 100000;
-          const ask = askRaw / 100000;
-          const px = (bid + ask) / 2;
-
-          if (px > 0) {
-            updateLiveCandle(id, px, q);
-            processed++;
-          }
-        });
-
-        if (processed > 0) {
-          drawAll();
+      // مهم: listener قبل از subscribeQuotes
+      quoteEvent(state.adapter).subscribe({
+        next: handleQuoteEvent,
+        error: e => {
+          console.error("[Multi Charts] quoteEvent stream error", e);
+          setStatus("quoteEvent error: " + (e?.message || e));
         }
       });
 
       loadSymbols();
     }),
     catchError(err => {
-      console.error("[Multi Charts] host registration failed:", err);
-      setStatus("cTrader connection failed: " + (err?.message || String(err)));
-      $("symbolPicker").innerHTML = '<span class="smallnote">cTrader connection failed. Make sure this page runs as a cTrader plugin.</span>';
+      console.error("[Multi Charts] registration failed:", err);
+      setStatus("Connection failed: " + (err?.message || String(err)));
       return [];
     })
   ).subscribe();
@@ -215,13 +244,8 @@ function loadSymbols() {
     timeout(10000),
     tap(res => {
       const raw =
-        res?.payload?.Symbol ??
-        res?.payload?.symbol ??
-        res?.Symbol ??
-        res?.symbol ??
-        res?.symbols ??
-        res?.result?.symbol ??
-        [];
+        res?.payload?.Symbol ?? res?.payload?.symbol ??
+        res?.Symbol ?? res?.symbol ?? res?.symbols ?? [];
 
       state.allSymbols = (Array.isArray(raw) ? raw : [])
         .map(s => ({
@@ -233,25 +257,19 @@ function loadSymbols() {
         .filter(s => s?.symbolId != null && typeof s?.name === "string" && s.name.length)
         .sort((a, b) => a.name.localeCompare(b.name));
 
-      console.info("[Multi Charts] symbols loaded:", state.allSymbols.length);
-
       if (!state.allSymbols.length) {
-        state.selected = [];
+        setStatus("No symbols returned.");
         renderPicker();
-        setStatus("No symbols returned by cTrader.");
         return;
       }
 
-      // اولویت با نمادهای Enabled و majorها
       if (!state.selected.length) {
-        const majors = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "USDCHF", "EURJPY"];
+        const majors = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","NZDUSD","USDCHF","EURJPY"];
         const enabled = state.allSymbols.filter(s => s.enabled !== false);
-
         state.selected = majors
           .map(n => enabled.find(s => s.name.toUpperCase() === n) || state.allSymbols.find(s => s.name.toUpperCase() === n))
           .filter(Boolean)
           .map(s => s.symbolId);
-
         if (!state.selected.length) {
           const pool = enabled.length ? enabled : state.allSymbols;
           state.selected = pool.slice(0, 6).map(s => s.symbolId);
@@ -260,23 +278,17 @@ function loadSymbols() {
 
       renderPicker();
       loadAllCharts();
-      setStatus("Connected • " + state.allSymbols.length + " broker symbols loaded");
+      setStatus("Connected • " + state.allSymbols.length + " symbols loaded");
     }),
     catchError(err => {
-      console.error("[Multi Charts] getLightSymbolList failed:", err);
-      setStatus("Could not load symbols: " + (err?.message || String(err)));
-      $("symbolPicker").innerHTML = '<span class="smallnote">Could not load symbols. Reopen the plugin and check the Console.</span>';
+      setStatus("Symbol load failed: " + (err?.message || err));
       return [];
     })
   ).subscribe();
 }
 
 function timeframeMs() {
-  const minutes = {
-    1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 10,
-    7: 15, 8: 30, 9: 60, 10: 240, 11: 720,
-    12: 1440, 13: 10080
-  };
+  const minutes = {1:1,2:2,3:3,4:4,5:5,6:10,7:15,8:30,9:60,10:240,11:720,12:1440,13:10080};
   if (state.settings.tf === 14) return 30 * 24 * 60 * 60 * 1000;
   return (minutes[state.settings.tf] || 15) * 60 * 1000;
 }
@@ -313,21 +325,12 @@ function updateLiveCandle(id, price, q) {
     last.low = Math.min(last.low, price);
   }
 
-  if (bars.length > state.settings.count) {
-    bars = bars.slice(-state.settings.count);
-  }
+  if (bars.length > state.settings.count) bars = bars.slice(-state.settings.count);
   state.bars.set(id, bars);
-}
-
-function requestBars(symbol) {
-  // در SDK 0.0.9 تابع getTrendbarList در دسترس نیست.
-  // شمع‌ها از استریم قیمت زنده ساخته می‌شوند.
-  state.bars.set(String(symbol.symbolId), []);
 }
 
 function loadAllCharts() {
   renderCharts();
-
   const chosen = state.selected
     .map(id => state.allSymbols.find(s => Number(s.symbolId) === Number(id)))
     .filter(Boolean);
@@ -337,27 +340,33 @@ function loadAllCharts() {
     return;
   }
 
-  setStatus("Loading " + chosen.length + " symbols • " + (state.tfNames[state.settings.tf] || "TF"));
+  const ids = chosen.map(s => Number(s.symbolId));
+  setStatus("Subscribing quotes for " + ids.length + " symbols…");
 
-  subscribeQuotes(state.adapter, {
-    symbolId: chosen.map(s => Number(s.symbolId))
-  }).pipe(take(1)).subscribe({
-    next: () => {
-      setStatus("Subscribed • waiting for live prices • " + chosen.length + " symbols • " + (state.tfNames[state.settings.tf] || "TF"));
-    },
-    error: e => {
-      console.warn("Quote subscription error", e);
-      setStatus("Quote subscription error: " + (e?.message || e));
-    }
-  });
+  // امتحان هر دو شکل پارامتر
+  const trySub = (payload, label) => {
+    subscribeQuotes(state.adapter, payload).pipe(take(1), timeout(8000)).subscribe({
+      next: res => {
+        console.log("[Multi Charts] subscribeQuotes OK (" + label + "):", res);
+        setStatus("Subscribed (" + label + ") • waiting for quotes • " + ids.length + " symbols");
+      },
+      error: e => {
+        console.warn("[Multi Charts] subscribeQuotes failed (" + label + "):", e);
+        setStatus("subscribeQuotes " + label + " failed: " + (e?.message || e));
+      }
+    });
+  };
 
-  chosen.forEach(requestBars);
+  trySub({ symbolId: ids }, "symbolId");
+  // بعضی بیلدها symbolIds می‌خواهند
+  setTimeout(() => trySub({ symbolIds: ids }, "symbolIds"), 300);
+
+  chosen.forEach(s => state.bars.set(String(s.symbolId), state.bars.get(String(s.symbolId)) || []));
 }
 
 function renderCharts() {
   const root = $("charts");
   root.innerHTML = "";
-
   const chosen = state.selected
     .map(id => state.allSymbols.find(s => Number(s.symbolId) === Number(id)))
     .filter(Boolean);
@@ -377,42 +386,34 @@ function renderCharts() {
     label.className = "chart-label";
     label.style.fontSize = state.settings.fontSize + "px";
     label.textContent = s.name + " ";
-
     const tf = document.createElement("span");
     tf.textContent = state.tfNames[state.settings.tf] || "";
     label.appendChild(tf);
 
     const canvas = document.createElement("canvas");
     canvas.dataset.id = s.symbolId;
-
     el.append(label, canvas);
     el.addEventListener("click", () => openSymbol(s));
     root.appendChild(el);
   });
-
   drawAll();
 }
 
-function drawAll() {
-  state.selected.forEach(id => drawOne(id));
-}
+function drawAll() { state.selected.forEach(id => drawOne(id)); }
 
 function drawOne(id) {
   const canvas = document.querySelector('canvas[data-id="' + id + '"]');
   if (!canvas) return;
-
   const rect = canvas.getBoundingClientRect();
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   if (!rect.width || !rect.height) return;
 
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
-
   const ctx = canvas.getContext("2d");
   ctx.scale(dpr, dpr);
 
-  const w = rect.width;
-  const h = rect.height;
+  const w = rect.width, h = rect.height;
   ctx.fillStyle = "#070b12";
   ctx.fillRect(0, 0, w, h);
 
@@ -427,12 +428,8 @@ function drawOne(id) {
   const lo = Math.min(...bars.map(b => b.low));
   const hi = Math.max(...bars.map(b => b.high));
   const pad = Math.max((hi - lo) * 0.10, Math.abs(hi) * 0.00005);
-  const min = lo - pad;
-  const max = hi + pad;
-  const range = max - min || 1;
-  const top = 31;
-  const bottom = 8;
-  const plotH = h - top - bottom;
+  const min = lo - pad, max = hi + pad, range = max - min || 1;
+  const top = 31, bottom = 8, plotH = h - top - bottom;
   const slot = w / bars.length;
   const cw = Math.max(1, Math.min(8, slot * 0.66));
   const y = p => top + (max - p) / range * plotH;
@@ -441,41 +438,33 @@ function drawOne(id) {
     const x = i * slot + slot / 2;
     const up = b.close >= b.open;
     const col = up ? state.settings.up : state.settings.down;
-
     ctx.strokeStyle = col;
     ctx.lineWidth = Math.max(1, slot * 0.12);
     ctx.beginPath();
     ctx.moveTo(x, y(b.high));
     ctx.lineTo(x, y(b.low));
     ctx.stroke();
-
     const yo = y(Math.max(b.open, b.close));
     const yc = y(Math.min(b.open, b.close));
-    const bh = Math.max(1, yc - yo);
     ctx.fillStyle = col;
-    ctx.fillRect(x - cw / 2, yo, cw, bh);
+    ctx.fillRect(x - cw / 2, yo, cw, Math.max(1, yc - yo));
   });
 
   const q = state.quotes.get(String(id));
   if (q) {
-    const bid = safeNum(q.bid ?? q.Bid) / 100000;
-    const ask = safeNum(q.ask ?? q.Ask) / 100000;
+    let bidRaw = safeNum(q.bid ?? q.Bid);
+    let askRaw = safeNum(q.ask ?? q.Ask);
+    const bid = (bidRaw > 1000 ? bidRaw / 100000 : bidRaw);
+    const ask = (askRaw > 1000 ? askRaw / 100000 : askRaw);
     ctx.setLineDash([4, 4]);
     ctx.lineWidth = 1;
-
     if (bid > 0) {
       ctx.strokeStyle = state.settings.bid;
-      ctx.beginPath();
-      ctx.moveTo(0, y(bid));
-      ctx.lineTo(w, y(bid));
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, y(bid)); ctx.lineTo(w, y(bid)); ctx.stroke();
     }
     if (ask > 0) {
       ctx.strokeStyle = state.settings.ask;
-      ctx.beginPath();
-      ctx.moveTo(0, y(ask));
-      ctx.lineTo(w, y(ask));
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, y(ask)); ctx.lineTo(w, y(ask)); ctx.stroke();
     }
     ctx.setLineDash([]);
   }
@@ -492,18 +481,11 @@ function renderPicker() {
   const q = $("searchSymbols").value.trim().toUpperCase();
   const root = $("symbolPicker");
   root.innerHTML = "";
-
   if (!state.allSymbols.length) {
-    root.innerHTML = '<span class="smallnote">Waiting for the broker symbol list…</span>';
+    root.innerHTML = '<span class="smallnote">Waiting for symbols…</span>';
     return;
   }
-
   const matches = state.allSymbols.filter(s => !q || s.name.toUpperCase().includes(q));
-  if (!matches.length) {
-    root.innerHTML = '<span class="smallnote">No matching symbols. Try another search.</span>';
-    return;
-  }
-
   matches.forEach(s => {
     const label = document.createElement("label");
     const cb = document.createElement("input");
@@ -531,14 +513,12 @@ function openSettings() {
 $("openSettings").addEventListener("click", openSettings);
 $("cancelSettings").addEventListener("click", () => $("settings").classList.remove("open"));
 $("searchSymbols").addEventListener("input", renderPicker);
-
 $("quickTf").addEventListener("change", e => {
   $("tf").value = e.target.value;
   state.settings.tf = Number(e.target.value);
   state.bars.clear();
   loadAllCharts();
 });
-
 $("applySettings").addEventListener("click", () => {
   state.settings.height = Math.max(80, Math.min(600, Number($("height").value) || 230));
   state.settings.count = Math.max(15, Math.min(250, Number($("zoom").value) || 65));
