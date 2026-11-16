@@ -92,6 +92,7 @@ import { take, tap, catchError, timeout } from "https://esm.sh/rxjs@7.8.2";
 import { createLogger } from "https://esm.sh/@veksa/logger@1.0.6";
 
 const $ = id => document.getElementById(id);
+
 const state = {
   adapter: null,
   connected: false,
@@ -139,21 +140,37 @@ function connect() {
       handleConfirmEvent(state.adapter, {}).pipe(take(1)).subscribe();
       state.connected = true;
       setStatus("Connected • Loading symbols…");
-      loadSymbols();
 
-      // Live quotes stream
-      quoteEvent(state.adapter).subscribe(ev => {
-        const list = ev?.quote ?? ev?.quotes ?? ev?.symbolQuote ?? [];
-        const quotes = Array.isArray(list) ? list : [ev];
+      // گوش دادن به quoteها باید قبل از subscribeQuotes باشد
+      quoteEvent(state.adapter).subscribe(rawEv => {
+        // پشتیبانی از ساختارهای مختلف (flat یا nested)
+        const candidates = [];
+        if (rawEv) candidates.push(rawEv);
+        if (rawEv?.payload) candidates.push(rawEv.payload);
+        if (rawEv?.payload?.payload) candidates.push(rawEv.payload.payload);
+        if (rawEv?.quote) {
+          const q = rawEv.quote;
+          if (Array.isArray(q)) candidates.push(...q);
+          else candidates.push(q);
+        }
+        if (rawEv?.quotes) {
+          const q = rawEv.quotes;
+          if (Array.isArray(q)) candidates.push(...q);
+          else candidates.push(q);
+        }
 
-        quotes.forEach(q => {
-          const quoteId = q?.symbolId ?? q?.SymbolId ?? q?.id ?? q?.Id;
+        let processed = 0;
+        candidates.forEach(q => {
+          if (!q || typeof q !== "object") return;
+
+          const quoteId = q.symbolId ?? q.SymbolId ?? q.id ?? q.Id;
           if (quoteId == null) return;
+
           const id = String(quoteId);
           state.quotes.set(id, q);
 
-          // If host supplies trendbars in the quote event
-          const supplied = q?.trendbar ?? q?.trendbars ?? q?.Trendbar ?? ev?.trendbar ?? ev?.trendbars;
+          // trendbar اگر وجود داشت
+          const supplied = q.trendbar ?? q.Trendbar ?? q.trendbars ?? [];
           if (Array.isArray(supplied) && supplied.length) {
             const incoming = supplied.map(b => decodeTrendbar(b)).filter(Boolean);
             if (incoming.length) {
@@ -161,15 +178,25 @@ function connect() {
             }
           }
 
-          // Always keep a live candle from the quote
-          const bid = safeNum(q.bid ?? q.Bid);
-          const ask = safeNum(q.ask ?? q.Ask);
-          const px = (bid + ask) / 2 / 100000;
-          if (px > 0) updateLiveCandle(id, px, q);
+          // قیمت زنده (طبق مستندات: واحد 1/100000)
+          const bidRaw = safeNum(q.bid ?? q.Bid);
+          const askRaw = safeNum(q.ask ?? q.Ask);
+          const bid = bidRaw / 100000;
+          const ask = askRaw / 100000;
+          const px = (bid + ask) / 2;
+
+          if (px > 0) {
+            updateLiveCandle(id, px, q);
+            processed++;
+          }
         });
 
-        drawAll();
+        if (processed > 0) {
+          drawAll();
+        }
       });
+
+      loadSymbols();
     }),
     catchError(err => {
       console.error("[Multi Charts] host registration failed:", err);
@@ -187,7 +214,6 @@ function loadSymbols() {
     take(1),
     timeout(10000),
     tap(res => {
-      // پشتیبانی از ساختارهای مختلف پاسخ (از جمله payload.Symbol با حرف بزرگ)
       const raw =
         res?.payload?.Symbol ??
         res?.payload?.symbol ??
@@ -201,12 +227,13 @@ function loadSymbols() {
         .map(s => ({
           ...s,
           symbolId: s?.symbolId ?? s?.Id ?? s?.id,
-          name: s?.name ?? s?.Name ?? s?.symbolName
+          name: s?.name ?? s?.Name ?? s?.symbolName,
+          enabled: s?.enabled ?? s?.Enabled ?? true
         }))
         .filter(s => s?.symbolId != null && typeof s?.name === "string" && s.name.length)
         .sort((a, b) => a.name.localeCompare(b.name));
 
-      console.info("[Multi Charts] normalized symbols:", state.allSymbols.length);
+      console.info("[Multi Charts] symbols loaded:", state.allSymbols.length);
 
       if (!state.allSymbols.length) {
         state.selected = [];
@@ -215,15 +242,19 @@ function loadSymbols() {
         return;
       }
 
+      // اولویت با نمادهای Enabled و majorها
       if (!state.selected.length) {
-        const defaults = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"];
-        state.selected = defaults
-          .map(n => state.allSymbols.find(s => s.name.toUpperCase() === n))
+        const majors = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "USDCHF", "EURJPY"];
+        const enabled = state.allSymbols.filter(s => s.enabled !== false);
+
+        state.selected = majors
+          .map(n => enabled.find(s => s.name.toUpperCase() === n) || state.allSymbols.find(s => s.name.toUpperCase() === n))
           .filter(Boolean)
           .map(s => s.symbolId);
 
         if (!state.selected.length) {
-          state.selected = state.allSymbols.slice(0, 6).map(s => s.symbolId);
+          const pool = enabled.length ? enabled : state.allSymbols;
+          state.selected = pool.slice(0, 6).map(s => s.symbolId);
         }
       }
 
@@ -311,6 +342,9 @@ function loadAllCharts() {
   subscribeQuotes(state.adapter, {
     symbolId: chosen.map(s => Number(s.symbolId))
   }).pipe(take(1)).subscribe({
+    next: () => {
+      setStatus("Subscribed • waiting for live prices • " + chosen.length + " symbols • " + (state.tfNames[state.settings.tf] || "TF"));
+    },
     error: e => {
       console.warn("Quote subscription error", e);
       setStatus("Quote subscription error: " + (e?.message || e));
@@ -318,7 +352,6 @@ function loadAllCharts() {
   });
 
   chosen.forEach(requestBars);
-  setStatus("Subscribed • waiting for live prices • " + chosen.length + " symbols • " + (state.tfNames[state.settings.tf] || "TF"));
 }
 
 function renderCharts() {
@@ -477,7 +510,7 @@ function renderPicker() {
     cb.type = "checkbox";
     cb.value = s.symbolId;
     cb.checked = state.selected.some(id => Number(id) === Number(s.symbolId));
-    label.append(cb, document.createTextNode(s.name));
+    label.append(cb, document.createTextNode(s.name + (s.enabled === false ? " (off)" : "")));
     root.appendChild(label);
   });
 }
