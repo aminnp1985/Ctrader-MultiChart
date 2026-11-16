@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>cTrader Connection Diagnostic</title>
+<title>cTrader Connection Diagnostic (Auto-Retry)</title>
 <style>
   body { background:#0b111b; color:#e8eef7; font-family:monospace; padding:16px; font-size:13px; }
   h2 { color:#2f9cff; font-size:16px; margin:0 0 12px; }
@@ -13,14 +13,14 @@
 </style>
 </head>
 <body>
-<h2>cTrader Plugin Connection Diagnostic</h2>
+<h2>cTrader Plugin Diagnostic (Auto-Retry Enabled)</h2>
 <div id="log">Initializing…</div>
-<button id="retry">Reconnect</button>
+<button id="retry">Manual Reconnect</button>
 
 <script type="module">
 import { createClientAdapter } from "https://esm.sh/@spotware-web-team/sdk-external-api@0.0.5";
 import { handleConfirmEvent, registerEvent, getLightSymbolList } from "https://esm.sh/@spotware-web-team/sdk@0.0.9";
-import { take, tap, catchError } from "https://esm.sh/rxjs@7.8.2";
+import { take, tap, catchError, timeout } from "https://esm.sh/rxjs@7.8.2";
 import { createLogger } from "https://esm.sh/@veksa/logger@1.0.6";
 
 const logEl = document.getElementById("log");
@@ -35,11 +35,12 @@ const append = (msg, cls = "") => {
 
 let adapter = null;
 let connected = false;
+let retryCount = 0;
 
 function connect() {
   logEl.innerHTML = "";
   connected = false;
-  append("Step 1: Creating adapter…", "info");
+  append(`Attempt #${retryCount + 1}: Creating adapter…`, "info");
 
   try {
     const logger = createLogger(false);
@@ -47,32 +48,54 @@ function connect() {
     append("Adapter created successfully.", "ok");
   } catch (e) {
     append("Failed to create adapter: " + e.message, "err");
+    scheduleRetry();
     return;
   }
 
-  // ❌ تأیید اولیه حذف شد (طبق هشدار مستندات درباره ارسال چندگانه)
-
-  append("Step 2: Sending registerEvent…", "info");
+  append("Sending registerEvent… (Waiting for cTrader response, 5s timeout)", "info");
+  
+  // استفاده از timeout برای جلوگیری از گیر کردن بی‌نهایت
   registerEvent(adapter).pipe(
     take(1),
+    timeout(5000), // اگر بعد از 5 ثانیه پاسخی نیامد، خطا می‌دهد
     tap(() => {
-      append("registerEvent response received. Sending the single confirmEvent…", "ok");
+      append("registerEvent response received! Sending confirmEvent…", "ok");
+      retryCount = 0; // ریست کردن شمارنده تلاش مجدد
 
-      // ✅ تنها تأییدیه را همین‌جا ارسال کنید
       handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
         next: () => {
           connected = true;
-          append("Connection confirmed successfully.", "ok");
+          append("Connection confirmed successfully!", "ok");
           setTimeout(() => fetchAccountAndSymbols(), 300);
         },
-        error: (e) => append("confirmEvent failed: " + (e?.message || e), "err")
+        error: (e) => {
+          append("confirmEvent failed: " + (e?.message || e), "err");
+          scheduleRetry();
+        }
       });
     }),
     catchError(err => {
-      append("registerEvent failed: " + (err?.message || String(err)), "err");
-      return [];
+      // تشخیص اینکه خطا از نوع Timeout است یا خطای دیگر شبکه
+      const isTimeout = err?.name === 'TimeoutError' || String(err).includes('Timeout');
+      const errMsg = isTimeout ? "Server did not respond in 5 seconds (Timeout)." : (err?.message || String(err));
+      
+      append("registerEvent failed: " + errMsg, "err");
+      append("Retrying in 3 seconds...", "warn");
+      
+      scheduleRetry();
+      return []; // جلوگیری از خطای بیشتر
     })
   ).subscribe();
+}
+
+function scheduleRetry() {
+  if (adapter) {
+    try { adapter.dispose?.(); } catch (e) {}
+  }
+  retryCount++;
+  // اگر بیش از 10 بار تلاش کرد، کمی بیشتر صبر می‌کند تا سرور فرصت ریکاوری داشته باشد
+  const delay = retryCount > 10 ? 10000 : 3000; 
+  setTimeout(() => connect(), delay);
 }
 
 function fetchAccountAndSymbols() {
@@ -81,7 +104,7 @@ function fetchAccountAndSymbols() {
   append("Step 3: Requesting account information…", "info");
   import("https://esm.sh/@spotware-web-team/sdk@0.0.9").then(sdk => {
     if (typeof sdk.getAccountInformation === "function") {
-      sdk.getAccountInformation(adapter).pipe(take(1)).subscribe({
+      sdk.getAccountInformation(adapter).pipe(take(1), timeout(5000)).subscribe({
         next: (res) => append("Account information: " + JSON.stringify(res, null, 2), "ok"),
         error: (e) => append("Failed to get account information: " + (e?.message || e), "err")
       });
@@ -93,6 +116,7 @@ function fetchAccountAndSymbols() {
   append("Step 4: Requesting symbol list…", "info");
   getLightSymbolList(adapter, {}).pipe(
     take(1),
+    timeout(5000),
     tap(res => {
       append("Raw response: " + JSON.stringify(res).slice(0, 500), "ok");
       const raw = res?.symbol ?? res?.symbols ?? res?.result?.symbol ?? res;
@@ -110,12 +134,11 @@ function fetchAccountAndSymbols() {
 }
 
 document.getElementById("retry").addEventListener("click", () => {
-  if (adapter) {
-    try { adapter.dispose?.(); } catch (e) {}
-  }
+  retryCount = 0;
   connect();
 });
 
+// شروع فرآیند
 connect();
 </script>
 </body>
