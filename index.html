@@ -13,13 +13,13 @@
 </style>
 </head>
 <body>
-<h2>cTrader Plugin Diagnostic</h2>
+<h2>cTrader Plugin Diagnostic (Debug Mode)</h2>
 <div id="log">Initializing…</div>
 <button id="retry">Manual Reconnect</button>
 
 <script type="module">
 import { createClientAdapter } from "https://esm.sh/@spotware-web-team/sdk-external-api@0.0.5";
-import { handleConfirmEvent, registerEvent, getLightSymbolList, getAccountInformation } from "https://esm.sh/@spotware-web-team/sdk@0.0.9";
+import { handleConfirmEvent, registerEvent } from "https://esm.sh/@spotware-web-team/sdk@0.0.9";
 import { take, tap, catchError, timeout } from "https://esm.sh/rxjs@7.8.2";
 import { createLogger } from "https://esm.sh/@veksa/logger@1.0.6";
 
@@ -34,115 +34,128 @@ const append = (msg, cls = "") => {
 };
 
 let adapter = null;
-let connected = false;
 
 function connect() {
   logEl.innerHTML = "";
-  connected = false;
-
+  
   if (adapter) {
     try { adapter.dispose?.(); } catch (e) {}
     adapter = null;
   }
 
-  append("Creating adapter…", "info");
+  append("1. Creating adapter…", "info");
 
   try {
     const logger = createLogger(false);
     adapter = createClientAdapter({ logger });
-    append("Adapter created.", "ok");
+    append("2. Adapter created successfully.", "ok");
   } catch (e) {
-    append("Failed to create adapter: " + e.message, "err");
+    append("Adapter creation failed: " + e.message, "err");
     return;
   }
 
-  // 1. First confirm (مثل مثال رسمی)
-  append("Sending first confirmEvent…", "info");
-  handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
-    error: (e) => append("First confirmEvent warning: " + (e?.message || e), "warn")
-  });
+  // First confirm
+  append("3. Sending first confirmEvent…", "info");
+  try {
+    handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
+      next: () => append("   → first confirmEvent next", "info"),
+      error: (e) => append("   → first confirmEvent error: " + (e?.message || e), "warn"),
+      complete: () => append("   → first confirmEvent complete", "info")
+    });
+  } catch (e) {
+    append("Exception while calling first confirmEvent: " + e.message, "err");
+  }
 
-  // 2. registerEvent
-  append("Sending registerEvent (waiting for host)…", "info");
+  // registerEvent
+  append("4. Sending registerEvent…", "info");
 
   registerEvent(adapter).pipe(
     take(1),
-    timeout(10000),
-    tap(() => {
-      append("registerEvent response received!", "ok");
+    timeout(12000),
+    tap({
+      next: (value) => {
+        append("5. registerEvent SUCCESS. Value: " + JSON.stringify(value).slice(0, 200), "ok");
 
-      // 3. Second confirm را فقط می‌فرستیم و منتظر نمی‌مانیم (مثل مثال رسمی)
-      handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe();
+        // حالا سعی می‌کنیم دومین confirm را بفرستیم
+        append("6. Trying to send second confirmEvent…", "info");
+        try {
+          handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
+            next: () => append("   → second confirmEvent next", "ok"),
+            error: (e) => append("   → second confirmEvent error: " + (e?.message || e), "warn"),
+            complete: () => append("   → second confirmEvent complete", "ok")
+          });
+          append("7. Second confirmEvent call executed (no exception).", "ok");
+        } catch (e) {
+          append("Exception while calling second confirmEvent: " + e.message, "err");
+        }
 
-      // بلافاصله connected می‌کنیم
-      connected = true;
-      append("Connection confirmed successfully!", "ok");
+        append("8. Connection considered SUCCESSFUL.", "ok");
+        append("--------------------------------", "info");
+        append("Now trying to call other methods…", "info");
 
-      setTimeout(() => {
-        fetchAccountAndSymbols();
-      }, 500);
+        // تست متدها
+        setTimeout(() => testMethods(), 800);
+      },
+      error: (err) => {
+        append("registerEvent error inside tap: " + (err?.message || err), "err");
+      }
     }),
     catchError(err => {
-      const isTimeout = err?.name === 'TimeoutError' || String(err).includes('Timeout');
-      const errMsg = isTimeout
-        ? "Host did not respond within 10 seconds (Timeout)."
-        : (err?.message || String(err));
-
-      append("registerEvent failed: " + errMsg, "err");
+      const msg = err?.name === 'TimeoutError' ? "Timeout (12s)" : (err?.message || String(err));
+      append("registerEvent FAILED: " + msg, "err");
       return [];
     })
-  ).subscribe();
+  ).subscribe({
+    error: (e) => append("Outer subscribe error: " + (e?.message || e), "err")
+  });
 }
 
-function fetchAccountAndSymbols() {
-  if (!connected || !adapter) {
-    append("Not connected, skipping data requests.", "warn");
+async function testMethods() {
+  if (!adapter) {
+    append("No adapter available", "err");
     return;
   }
 
-  // Account Information
-  append("Requesting account information…", "info");
-  getAccountInformation(adapter, {}).pipe(
-    take(1),
-    timeout(8000)
-  ).subscribe({
-    next: (res) => {
-      append("Account information received:", "ok");
-      append(JSON.stringify(res, null, 2), "ok");
-    },
-    error: (e) => {
-      append("getAccountInformation failed: " + (e?.message || e), "err");
-    }
-  });
+  // تست getLightSymbolList
+  try {
+    append("Testing getLightSymbolList…", "info");
+    const { getLightSymbolList } = await import("https://esm.sh/@spotware-web-team/sdk@0.0.9");
+    
+    getLightSymbolList(adapter, {}).pipe(
+      take(1),
+      timeout(8000)
+    ).subscribe({
+      next: (res) => {
+        append("getLightSymbolList SUCCESS", "ok");
+        append(JSON.stringify(res).slice(0, 600), "ok");
+      },
+      error: (e) => append("getLightSymbolList failed: " + (e?.message || e), "err")
+    });
+  } catch (e) {
+    append("Exception importing/calling getLightSymbolList: " + e.message, "err");
+  }
 
-  // Symbol List
-  append("Requesting light symbol list…", "info");
-  getLightSymbolList(adapter, {}).pipe(
-    take(1),
-    timeout(8000)
-  ).subscribe({
-    next: (res) => {
-      append("Symbol list response received.", "ok");
-      const raw = res?.symbol ?? res?.symbols ?? res?.result?.symbol ?? res;
-      const arr = Array.isArray(raw) ? raw : [];
-      append(`Parsed ${arr.length} symbols.`, arr.length > 0 ? "ok" : "warn");
-
-      if (arr.length > 0) {
-        append("First 3 symbols:", "info");
-        append(JSON.stringify(arr.slice(0, 3), null, 2));
-      } else {
-        append("Raw response: " + JSON.stringify(res).slice(0, 800), "info");
-      }
-    },
-    error: (e) => {
-      append("getLightSymbolList failed: " + (e?.message || e), "err");
-    }
-  });
+  // تست getAccountInformation
+  try {
+    append("Testing getAccountInformation…", "info");
+    const { getAccountInformation } = await import("https://esm.sh/@spotware-web-team/sdk@0.0.9");
+    
+    getAccountInformation(adapter, {}).pipe(
+      take(1),
+      timeout(8000)
+    ).subscribe({
+      next: (res) => {
+        append("getAccountInformation SUCCESS", "ok");
+        append(JSON.stringify(res, null, 2), "ok");
+      },
+      error: (e) => append("getAccountInformation failed: " + (e?.message || e), "err")
+    });
+  } catch (e) {
+    append("Exception importing/calling getAccountInformation: " + e.message, "err");
+  }
 }
 
 document.getElementById("retry").addEventListener("click", connect);
-
-// شروع
 connect();
 </script>
 </body>
