@@ -3,159 +3,87 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>cTrader Connection Diagnostic</title>
+<title>cTrader Plugin</title>
 <style>
   body { background:#0b111b; color:#e8eef7; font-family:monospace; padding:16px; font-size:13px; }
-  h2 { color:#2f9cff; font-size:16px; margin:0 0 12px; }
-  #log { white-space:pre-wrap; word-break:break-all; background:#070b12; border:1px solid #273344; padding:12px; border-radius:8px; min-height:200px; max-height:70vh; overflow:auto; }
-  .ok { color:#18c79a; } .err { color:#f04452; } .warn { color:#ffb347; } .info { color:#91a0b5; }
-  button { background:#151f2d; color:#e8eef7; border:1px solid #2a394d; border-radius:6px; padding:8px 16px; margin-top:12px; cursor:pointer; }
+  h2 { color:#2f9cff; margin:0 0 12px; }
+  #log { white-space:pre-wrap; background:#070b12; border:1px solid #273344; padding:12px; border-radius:8px; min-height:180px; max-height:70vh; overflow:auto; }
+  .ok { color:#18c79a; } .err { color:#f04452; } .info { color:#91a0b5; }
+  button { background:#151f2d; color:#e8eef7; border:1px solid #2a394d; border-radius:6px; padding:8px 14px; margin-top:12px; cursor:pointer; }
 </style>
 </head>
 <body>
-<h2>cTrader Plugin Diagnostic (Debug Mode)</h2>
-<div id="log">Initializing…</div>
-<button id="retry">Manual Reconnect</button>
+<h2>cTrader Plugin Connected</h2>
+<div id="log">Connecting…</div>
+<button id="retry">Reconnect</button>
 
 <script type="module">
 import { createClientAdapter } from "https://esm.sh/@spotware-web-team/sdk-external-api@0.0.5";
-import { handleConfirmEvent, registerEvent } from "https://esm.sh/@spotware-web-team/sdk@0.0.9";
-import { take, tap, catchError, timeout } from "https://esm.sh/rxjs@7.8.2";
+import { handleConfirmEvent, registerEvent, getLightSymbolList, getAccountInformation } from "https://esm.sh/@spotware-web-team/sdk@0.0.9";
+import { take, timeout } from "https://esm.sh/rxjs@7.8.2";
 import { createLogger } from "https://esm.sh/@veksa/logger@1.0.6";
 
 const logEl = document.getElementById("log");
-const append = (msg, cls = "") => {
-  const line = document.createElement("div");
-  if (cls) line.className = cls;
-  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-  logEl.appendChild(line);
+const log = (msg, cls = "info") => {
+  const div = document.createElement("div");
+  div.className = cls;
+  div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
-  console.log(msg);
 };
 
 let adapter = null;
 
 function connect() {
   logEl.innerHTML = "";
-  
   if (adapter) {
-    try { adapter.dispose?.(); } catch (e) {}
+    try { adapter.dispose?.(); } catch {}
     adapter = null;
   }
 
-  append("1. Creating adapter…", "info");
-
   try {
-    const logger = createLogger(false);
-    adapter = createClientAdapter({ logger });
-    append("2. Adapter created successfully.", "ok");
+    adapter = createClientAdapter({ logger: createLogger(false) });
+    log("Adapter created", "ok");
   } catch (e) {
-    append("Adapter creation failed: " + e.message, "err");
+    log("Adapter failed: " + e.message, "err");
     return;
   }
 
-  // First confirm
-  append("3. Sending first confirmEvent…", "info");
-  try {
-    handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
-      next: () => append("   → first confirmEvent next", "info"),
-      error: (e) => append("   → first confirmEvent error: " + (e?.message || e), "warn"),
-      complete: () => append("   → first confirmEvent complete", "info")
-    });
-  } catch (e) {
-    append("Exception while calling first confirmEvent: " + e.message, "err");
-  }
-
-  // registerEvent
-  append("4. Sending registerEvent…", "info");
+  // Handshake طبق مستندات رسمی
+  handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe();
 
   registerEvent(adapter).pipe(
     take(1),
-    timeout(12000),
-    tap({
-      next: (value) => {
-        append("5. registerEvent SUCCESS. Value: " + JSON.stringify(value).slice(0, 200), "ok");
-
-        // حالا سعی می‌کنیم دومین confirm را بفرستیم
-        append("6. Trying to send second confirmEvent…", "info");
-        try {
-          handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
-            next: () => append("   → second confirmEvent next", "ok"),
-            error: (e) => append("   → second confirmEvent error: " + (e?.message || e), "warn"),
-            complete: () => append("   → second confirmEvent complete", "ok")
-          });
-          append("7. Second confirmEvent call executed (no exception).", "ok");
-        } catch (e) {
-          append("Exception while calling second confirmEvent: " + e.message, "err");
-        }
-
-        append("8. Connection considered SUCCESSFUL.", "ok");
-        append("--------------------------------", "info");
-        append("Now trying to call other methods…", "info");
-
-        // تست متدها
-        setTimeout(() => testMethods(), 800);
-      },
-      error: (err) => {
-        append("registerEvent error inside tap: " + (err?.message || err), "err");
-      }
-    }),
-    catchError(err => {
-      const msg = err?.name === 'TimeoutError' ? "Timeout (12s)" : (err?.message || String(err));
-      append("registerEvent FAILED: " + msg, "err");
-      return [];
-    })
+    timeout(10000)
   ).subscribe({
-    error: (e) => append("Outer subscribe error: " + (e?.message || e), "err")
+    next: () => {
+      handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe();
+      log("Connected to cTrader successfully!", "ok");
+      setTimeout(loadData, 400);
+    },
+    error: (e) => log("Connection failed: " + (e?.message || e), "err")
   });
 }
 
-async function testMethods() {
-  if (!adapter) {
-    append("No adapter available", "err");
-    return;
-  }
+function loadData() {
+  getAccountInformation(adapter, {}).pipe(take(1), timeout(8000)).subscribe({
+    next: (res) => {
+      const trader = res?.payload?.Trader || res?.Trader || res;
+      log("Account: " + (trader?.Name || "—") + " | Login: " + (trader?.Login || "—") + " | Balance: " + (trader?.Balance ?? "—"), "ok");
+    },
+    error: (e) => log("Account info error: " + (e?.message || e), "err")
+  });
 
-  // تست getLightSymbolList
-  try {
-    append("Testing getLightSymbolList…", "info");
-    const { getLightSymbolList } = await import("https://esm.sh/@spotware-web-team/sdk@0.0.9");
-    
-    getLightSymbolList(adapter, {}).pipe(
-      take(1),
-      timeout(8000)
-    ).subscribe({
-      next: (res) => {
-        append("getLightSymbolList SUCCESS", "ok");
-        append(JSON.stringify(res).slice(0, 600), "ok");
-      },
-      error: (e) => append("getLightSymbolList failed: " + (e?.message || e), "err")
-    });
-  } catch (e) {
-    append("Exception importing/calling getLightSymbolList: " + e.message, "err");
-  }
-
-  // تست getAccountInformation
-  try {
-    append("Testing getAccountInformation…", "info");
-    const { getAccountInformation } = await import("https://esm.sh/@spotware-web-team/sdk@0.0.9");
-    
-    getAccountInformation(adapter, {}).pipe(
-      take(1),
-      timeout(8000)
-    ).subscribe({
-      next: (res) => {
-        append("getAccountInformation SUCCESS", "ok");
-        append(JSON.stringify(res, null, 2), "ok");
-      },
-      error: (e) => append("getAccountInformation failed: " + (e?.message || e), "err")
-    });
-  } catch (e) {
-    append("Exception importing/calling getAccountInformation: " + e.message, "err");
-  }
+  getLightSymbolList(adapter, {}).pipe(take(1), timeout(8000)).subscribe({
+    next: (res) => {
+      const symbols = res?.payload?.Symbol || res?.Symbol || [];
+      log(`Symbols loaded: ${symbols.length}`, "ok");
+    },
+    error: (e) => log("Symbols error: " + (e?.message || e), "err")
+  });
 }
 
-document.getElementById("retry").addEventListener("click", connect);
+document.getElementById("retry").onclick = connect;
 connect();
 </script>
 </body>
