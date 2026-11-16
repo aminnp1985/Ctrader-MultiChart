@@ -50,27 +50,22 @@ function connect() {
     return;
   }
 
-  // ✅ مطابق نمونه رسمی SDK: تأیید اولیه بلافاصله پس از ساخت adapter
-  append("Step 2a: Sending initial confirmEvent…", "info");
-  handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
-    next: () => append("Initial confirmEvent sent.", "ok"),
-    error: (e) => append("Initial confirmEvent failed: " + (e?.message || e), "err")
-  });
+  // ❌ تأیید اولیه حذف شد (طبق هشدار مستندات درباره ارسال چندگانه)
 
-  // ✅ ارسال registerEvent و سپس تأیید دوم داخل callback
-  append("Step 2b: Sending registerEvent…", "info");
+  append("Step 2: Sending registerEvent…", "info");
   registerEvent(adapter).pipe(
     take(1),
     tap(() => {
-      append("registerEvent response received. Sending final confirmEvent…", "ok");
+      append("registerEvent response received. Sending the single confirmEvent…", "ok");
 
+      // ✅ تنها تأییدیه را همین‌جا ارسال کنید
       handleConfirmEvent(adapter, {}).pipe(take(1)).subscribe({
         next: () => {
           connected = true;
           append("Connection confirmed successfully.", "ok");
           setTimeout(() => fetchAccountAndSymbols(), 300);
         },
-        error: (e) => append("Final confirmEvent failed: " + (e?.message || e), "err")
+        error: (e) => append("confirmEvent failed: " + (e?.message || e), "err")
       });
     }),
     catchError(err => {
