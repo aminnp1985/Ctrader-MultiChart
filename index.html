@@ -101,6 +101,7 @@ const state = {
   quotes: new Map(),
   quoteCount: 0,
   loggedFirstQuote: false,
+  lastBarLog: 0,
   settings: {
     height: 230, count: 65, tf: 7, fontSize: 14,
     up: "#18c79a", down: "#f04452", bid: "#2f9cff", ask: "#ff525e"
@@ -109,6 +110,27 @@ const state = {
     1:"M1",2:"M2",3:"M3",4:"M4",5:"M5",6:"M10",7:"M15",8:"M30",
     9:"H1",10:"H4",11:"H12",12:"D1",13:"W1",14:"MN1"
   }
+};
+
+// برای دیباگ در کنسول
+window.state = state;
+window.multiChartsDebug = () => {
+  const summary = {};
+  state.bars.forEach((bars, id) => {
+    const sym = state.allSymbols.find(s => String(s.symbolId) === String(id));
+    summary[sym?.name || id] = {
+      bars: bars.length,
+      last: bars[bars.length - 1],
+      first: bars[0]
+    };
+  });
+  console.log("=== MultiCharts Debug ===");
+  console.log("connected:", state.connected);
+  console.log("quoteCount:", state.quoteCount);
+  console.log("quotes.size:", state.quotes.size);
+  console.log("selected:", state.selected.length);
+  console.log("bars summary:", summary);
+  return summary;
 };
 
 const setStatus = s => { $("status").textContent = s; };
@@ -148,7 +170,20 @@ function handleQuoteEvent(rawEv) {
   if (!state.loggedFirstQuote) {
     state.loggedFirstQuote = true;
     console.log("[Multi Charts] FIRST quoteEvent raw:", rawEv);
-    try { console.log("[Multi Charts] FIRST quoteEvent JSON:", JSON.stringify(rawEv).slice(0, 1500)); } catch {}
+    try { console.log("[Multi Charts] FIRST quoteEvent JSON:", JSON.stringify(rawEv).slice(0, 2000)); } catch {}
+    // لاگ فیلدهای زمانی احتمالی
+    const sample = extractQuotes(rawEv)[0];
+    if (sample) {
+      console.log("[Multi Charts] sample quote keys:", Object.keys(sample));
+      console.log("[Multi Charts] sample time fields:", {
+        timestamp: sample.timestamp,
+        spotTimestamp: sample.spotTimestamp,
+        utcTimestamp: sample.utcTimestamp,
+        Timestamp: sample.Timestamp,
+        time: sample.time,
+        Time: sample.Time
+      });
+    }
   }
 
   const candidates = extractQuotes(rawEv);
@@ -189,8 +224,11 @@ function handleQuoteEvent(rawEv) {
 
   if (processed > 0) {
     state.quoteCount += processed;
-    if (state.quoteCount <= 3 || state.quoteCount % 20 === 0) {
-      setStatus("Live quotes: " + state.quoteCount + " updates • " + state.quotes.size + " symbols");
+    if (state.quoteCount <= 5 || state.quoteCount % 50 === 0) {
+      // تعداد کندل‌های واقعی رو هم نشون بده
+      let maxBars = 0;
+      state.bars.forEach(b => { if (b.length > maxBars) maxBars = b.length; });
+      setStatus("Live quotes: " + state.quoteCount + " • " + state.quotes.size + " symbols • max bars: " + maxBars);
     }
     drawAll();
   }
@@ -309,17 +347,51 @@ function decodeTrendbar(b) {
 
 function updateLiveCandle(id, price, q) {
   const interval = timeframeMs();
-  const rawTime = safeNum(q?.timestamp ?? q?.spotTimestamp ?? q?.utcTimestamp ?? q?.Timestamp);
-  const now = rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : Date.now();
+
+  // سعی کن بهترین timestamp رو پیدا کنی
+  let rawTime = safeNum(
+    q?.timestamp ?? q?.spotTimestamp ?? q?.utcTimestamp ?? q?.Timestamp ??
+    q?.time ?? q?.Time ?? q?.utcTime ?? q?.UtcTime
+  );
+
+  // بعضی فیلدها به صورت دقیقه یا ثانیه می‌آن
+  let now;
+  if (rawTime > 0) {
+    if (rawTime < 1e11) {          // احتمالاً ثانیه
+      now = rawTime * 1000;
+    } else if (rawTime < 1e13) {   // میلی‌ثانیه
+      now = rawTime;
+    } else {
+      now = Date.now();
+    }
+  } else {
+    now = Date.now();
+  }
+
+  // اگر timestamp خیلی قدیمی یا خیلی آینده بود، از ساعت سیستم استفاده کن
+  const drift = Math.abs(now - Date.now());
+  if (drift > 5 * 60 * 1000) { // بیشتر از ۵ دقیقه اختلاف
+    now = Date.now();
+  }
+
   const bucket = Math.floor(now / interval) * interval;
 
   let bars = state.bars.get(id) || [];
   let last = bars[bars.length - 1];
 
   if (!last || last.time !== bucket) {
+    // کندل جدید
     last = { time: bucket, open: price, high: price, low: price, close: price };
     bars.push(last);
+
+    // لاگ محدود برای دیدن ساخت کندل جدید
+    if (state.quoteCount < 30 || Date.now() - state.lastBarLog > 15000) {
+      state.lastBarLog = Date.now();
+      const sym = state.allSymbols.find(s => String(s.symbolId) === String(id));
+      console.log("[Multi Charts] NEW BAR", sym?.name || id, "time:", new Date(bucket).toISOString(), "price:", price, "totalBars:", bars.length);
+    }
   } else {
+    // آپدیت کندل جاری
     last.close = price;
     last.high = Math.max(last.high, price);
     last.low = Math.min(last.low, price);
